@@ -1,0 +1,98 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>CastLab</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #000; overflow: hidden; }
+  video { width: 100%; height: 100%; object-fit: contain; background: #000; }
+  #msg { position: fixed; left: 24px; bottom: 24px; color: #9a9a9a; font: 18px system-ui, sans-serif; }
+</style>
+<script src="//www.gstatic.com/cast/sdk/libs/caf_receiver/v3/cast_receiver_framework.js"></script>
+</head>
+<body>
+<video id="v" autoplay muted playsinline></video>
+<div id="msg">CastLab: waiting for the phone…</div>
+<script>
+// CastLab receiver page. Plays the phone's fragmented MP4 through MediaSource and stays near the live edge.
+// The stream URL comes from the phone app (custom message), from ?src=, or is /live.mp4 next to this page
+// when the phone itself serves the page. Works in a plain browser too (no Cast framework): open
+// http://<phone>:8090/ on the same Wi-Fi.
+const NAMESPACE = 'urn:x-cast:com.mashoodhussain.castlab';
+const video = document.getElementById('v');
+const msg = document.getElementById('msg');
+const params = new URLSearchParams(location.search);
+let context = null;
+let started = false;
+
+function say(text) { msg.textContent = text; }
+function report(state, message, behind) {
+  if (!context) return;
+  try { context.sendCustomMessage(NAMESPACE, undefined, { state, message: message || '', behind }); } catch (e) {}
+}
+
+function play(src) {
+  if (started) return;
+  started = true;
+  say('CastLab: connecting to ' + src);
+  const ms = new MediaSource();
+  video.src = URL.createObjectURL(ms);
+  ms.addEventListener('sourceopen', async () => {
+    const sb = ms.addSourceBuffer('video/mp4; codecs="avc1.640028"');
+    const queue = [];
+    const pump = () => { if (!sb.updating && queue.length) sb.appendBuffer(queue.shift()); };
+    sb.addEventListener('updateend', () => { pump(); if (video.paused) video.play().catch(() => {}); });
+    sb.addEventListener('error', () => { say('CastLab: decode error'); report('error', 'decode error'); });
+    try {
+      const res = await fetch(src);
+      if (!res.ok) throw new Error('HTTP ' + res.status);
+      const reader = res.body.getReader();
+      for (;;) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        queue.push(value);
+        pump();
+      }
+      say('CastLab: the phone stopped mirroring');
+      report('ended');
+      if (context) setTimeout(() => context.stop(), 3000);
+    } catch (e) {
+      say('CastLab: cannot reach the phone (' + e.message + ')');
+      report('error', e.message);
+    }
+  });
+  video.addEventListener('playing', () => { say(''); report('playing'); });
+  // Stay near the live edge: start where data begins, snap after a stall, nudge the rate when slightly
+  // behind, and trim old data so memory stays flat.
+  let tick = 0;
+  setInterval(() => {
+    if (!video.buffered.length) return;
+    const start = video.buffered.start(0);
+    const end = video.buffered.end(video.buffered.length - 1);
+    if (video.currentTime < start) video.currentTime = start;
+    const behind = end - video.currentTime;
+    if (behind > 1.5) video.currentTime = end - 0.3;
+    video.playbackRate = behind > 0.6 ? 1.1 : 1.0;
+    if (++tick % 4 === 0) report('stats', '', Math.round(behind * 100) / 100);   // every 2 s: the phone shows it
+    if (video.currentTime - start > 30) {
+      try { ms.sourceBuffers[0].remove(start, video.currentTime - 10); } catch (e) {}
+    }
+  }, 500);
+}
+
+if (window.cast && cast.framework) {
+  try {
+    context = cast.framework.CastReceiverContext.getInstance();
+    context.addCustomMessageListener(NAMESPACE, event => { if (event.data && event.data.url) play(event.data.url); });
+    context.start({ disableIdleTimeout: true, statusText: 'CastLab' });
+  } catch (e) {
+    context = null;                                      // not a Cast device: play on our own below
+  }
+}
+const own = new URL('/live.mp4', location.href).href;
+if (params.get('src')) play(params.get('src'));
+else if (location.protocol === 'http:') play(own);     // served by the phone: the stream is next door
+else if (!context) play(own);                            // plain browser over https: try anyway
+</script>
+</body>
+</html>
