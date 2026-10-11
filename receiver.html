@@ -6,12 +6,7 @@
 <style>
   html, body { margin: 0; height: 100%; background: #000; overflow: hidden; }
   video { width: 100%; height: 100%; object-fit: contain; background: #000; }
-  /* The buffered stream carries the screen as captured (portrait); when the phone is sideways the picture
-     is turned here. The box takes the screen's height for its width so the turned picture fills the TV. */
-  #v.turned { position: fixed; width: 100vh; height: 100vw; left: 50%; top: 50%; transform-origin: center; }
-  #v.r90 { transform: translate(-50%, -50%) rotate(90deg); }
-  #v.r180 { transform: rotate(180deg); }
-  #v.r270 { transform: translate(-50%, -50%) rotate(270deg); }
+
   #msg { position: fixed; left: 24px; bottom: 24px; color: #9a9a9a; font: 18px system-ui, sans-serif; }
 </style>
 <script src="//www.gstatic.com/cast/sdk/libs/caf_receiver/v3/cast_receiver_framework.js"></script>
@@ -50,7 +45,6 @@ function play(src) {
   const ms = new MediaSource();
   video.srcObject = null;                                // a WebRTC stream may have been attached before
   video.autoplay = false;                                // start once a second is buffered, not on the first frame
-  followOrientation(src.replace(/live\.mp4.*$/, 'events'));
   video.src = URL.createObjectURL(ms);
   ms.addEventListener('sourceopen', () => {
     const sb = ms.addSourceBuffer('video/mp4; codecs="avc1.640028, mp4a.40.2"');
@@ -91,7 +85,10 @@ function play(src) {
     if (video.currentTime < start) video.currentTime = start;
     const behind = end - video.currentTime;
     if (behind > 4) { video.currentTime = end - 1.0; snaps++; }
-    video.playbackRate = behind > 1.6 ? 1.05 : 1.0;
+    // Catch up at 2%, which the eye doesn't notice, and only switch rates with some room (hysteresis):
+    // every rate change is a tiny judder.
+    if (video.playbackRate === 1 && behind > 1.8) video.playbackRate = 1.02;
+    else if (video.playbackRate !== 1 && behind < 1.2) video.playbackRate = 1;
     if (++tick % 4 === 0) {                                                     // every 2 s: the phone shows it
       const q = video.getVideoPlaybackQuality ? video.getVideoPlaybackQuality() : null;
       report('stats', { mode: 'buffered', behind: Math.round(behind * 100) / 100, audio: (video.webkitAudioDecodedByteCount || 0) > 0,
@@ -106,24 +103,6 @@ function play(src) {
 
 // Streams the phone's video into the player and reconnects when the connection drops, for example on a
 // Wi-Fi hiccup. A clean end of the stream means the phone stopped mirroring.
-// Buffered mode: follow the phone's orientation (CGImagePropertyOrientation: 1 up, 3 upside down, 6 and
-// 8 sideways) with CSS. WebRTC mode needs none of this: the picture arrives already turned.
-let orientationSource = null;
-function followOrientation(eventsUrl) {
-  if (!window.EventSource || orientationSource) return;
-  orientationSource = new EventSource(eventsUrl);
-  orientationSource.onmessage = (event) => {
-    let o = 1;
-    try { o = JSON.parse(event.data).orientation || 1; } catch (e) {}
-    const cls = o === 6 ? 'turned r270' : o === 8 ? 'turned r90' : o === 3 ? 'r180' : '';
-    if (video.className !== cls) video.className = cls;
-  };
-}
-function stopFollowingOrientation() {
-  if (orientationSource) { orientationSource.close(); orientationSource = null; }
-  video.className = '';
-}
-
 function streamEnded() {
   say('CastLab: the phone stopped mirroring');
   report('ended');
