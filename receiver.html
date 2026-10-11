@@ -12,6 +12,7 @@
 </head>
 <body>
 <video id="v" autoplay playsinline></video>
+<audio id="a" autoplay></audio>
 <div id="msg">CastLab: waiting for the phone…</div>
 <script>
 // CastLab receiver page. Plays the phone's fragmented MP4 through MediaSource and stays near the live edge.
@@ -20,6 +21,9 @@
 // http://<phone>:8090/ on the same Wi-Fi.
 const NAMESPACE = 'urn:x-cast:com.mashoodhussain.castlab';
 const video = document.getElementById('v');
+const audioEl = document.getElementById('a');
+let audioStop = null;           // stops the separate sound stream, when the buffered video stream takes over
+let audioStats = {};
 const msg = document.getElementById('msg');
 const params = new URLSearchParams(location.search);
 let context = null;
@@ -83,26 +87,30 @@ function play(src) {
 
 // Streams the phone's video into the player and reconnects when the connection drops, for example on a
 // Wi-Fi hiccup. A clean end of the stream means the phone stopped mirroring.
-async function pull(src, sb, queue, pump) {
+function streamEnded() {
+  say('CastLab: the phone stopped mirroring');
+  report('ended');
+  if (context) setTimeout(() => context.stop(), 3000);
+}
+
+async function pull(src, sb, queue, pump, stop = { aborted: false }, onEnded = streamEnded) {
   let failures = 0;
   for (;;) {
+    if (stop.aborted) return;
     try {
-      const res = await fetch(src, { cache: 'no-store' });
+      stop.controller = new AbortController();
+      const res = await fetch(src, { cache: 'no-store', signal: stop.controller.signal });
       if (!res.ok) throw new Error('HTTP ' + res.status);
       failures = 0;
       const reader = res.body.getReader();
       for (;;) {
         const { value, done } = await reader.read();
-        if (done) {
-          say('CastLab: the phone stopped mirroring');
-          report('ended');
-          if (context) setTimeout(() => context.stop(), 3000);
-          return;
-        }
+        if (done) { onEnded(); return; }
         queue.push(value);
         pump();
       }
     } catch (e) {
+      if (stop.aborted) return;
       if (++failures > 20) {                       // about 10 s of tries: the phone is gone
         say('CastLab: cannot reach the phone (' + e.message + ')');
         report('error', { message: e.message });
@@ -117,13 +125,57 @@ async function pull(src, sb, queue, pump) {
   }
 }
 
-// WebRTC: the phone sends picture and sound as real-time media (UDP, encrypted, its own jitter buffer and
-// lip sync). The page makes the offer, POSTs it to the phone's signaling address and gets the answer.
-// If it never connects, the fragmented MP4 stream (`fallbackSrc`) takes over.
+// The sound, on its own stream next to the WebRTC video. Carried inside WebRTC it shared the phone's Wi-Fi
+// queue with the video and arrived in clumps whenever that queue backed up. Here it is AAC in a fragmented
+// MP4 over its own connection, played about 0.3 s behind the live edge, so queue hiccups don't reach the ear.
+function playAudioStream(src) {
+  const a = audioEl;
+  const ms = new MediaSource();
+  const stop = { aborted: false, controller: null };
+  let stalls = 0, sb = null;
+  a.src = URL.createObjectURL(ms);
+  a.addEventListener('waiting', () => { stalls++; });
+  ms.addEventListener('sourceopen', () => {
+    sb = ms.addSourceBuffer('audio/mp4; codecs="mp4a.40.2"');
+    const queue = [];
+    const pump = () => {
+      if (sb.updating || !queue.length) return;
+      try { sb.appendBuffer(queue.shift()); } catch (e) { queue.length = 0; }
+    };
+    sb.addEventListener('updateend', () => { pump(); if (a.paused) a.play().catch(() => {}); });
+    pull(src, sb, queue, pump, stop, () => {});          // the end of mirroring is announced by the video side
+  });
+  const timer = setInterval(() => {
+    const b = a.buffered;
+    if (!b.length) return;
+    const start = b.start(0), end = b.end(b.length - 1);
+    if (a.currentTime < start) a.currentTime = start;
+    const behind = end - a.currentTime;
+    if (behind > 1.0) a.currentTime = end - 0.3;                       // after a stall: snap back near live
+    a.playbackRate = behind > 0.4 ? 1.03 : behind < 0.2 ? 0.98 : 1;   // settles ~0.3 s behind; gentle, so the pitch stays steady
+    if (a.currentTime - start > 30) { try { sb.remove(start, a.currentTime - 10); } catch (e) {} }
+    audioStats = { audio: !a.paused && a.readyState >= 3, audioBehind: Math.round(behind * 100) / 100, audioStalls: stalls };
+  }, 500);
+  audioStop = () => {
+    clearInterval(timer);
+    stop.aborted = true;
+    if (stop.controller) stop.controller.abort();
+    a.pause();
+    a.removeAttribute('src');
+    a.load();
+    audioStats = {};
+  };
+}
+
+// WebRTC: the phone sends the picture as real-time video (UDP, encrypted, as little buffering as the Wi-Fi
+// allows). The page makes the offer, POSTs it to the phone's signaling address and gets the answer. The
+// sound comes separately (playAudioStream). If WebRTC never connects, the fragmented MP4 stream
+// (`fallbackSrc`, picture and sound together) takes over.
 async function playWebRTC(signal, fallbackSrc) {
   if (started) return;
   started = true;
   say('CastLab: connecting…');
+  playAudioStream(fallbackSrc.replace('live.mp4', 'live.m4a'));
   let pc = null, everConnected = false, failures = 0, retry = null, statsTimer = null, badReports = 0, switched = false;
   const prev = {};
   // The buffered stream holds half a second of picture and sound, so it rides out Wi-Fi stalls that WebRTC
@@ -135,6 +187,7 @@ async function playWebRTC(signal, fallbackSrc) {
     clearInterval(statsTimer);
     if (retry) { clearTimeout(retry); retry = null; }
     if (pc) { pc.close(); pc = null; }
+    if (audioStop) audioStop();                          // the buffered stream carries its own sound
     report('mode', { mode: 'buffered', message: why });
     started = false;
     play(fallbackSrc);
@@ -153,22 +206,15 @@ async function playWebRTC(signal, fallbackSrc) {
       const next = new RTCPeerConnection({ iceServers: [] });
       pc = next;
       window.castlabPC = next;                          // for the Mac test tools
-      const vt = next.addTransceiver('video', { direction: 'recvonly' });
-      const at = next.addTransceiver('audio', { direction: 'recvonly' });
-      try {                                             // RED first: each sound packet also carries the previous one, so
-        const codecs = RTCRtpReceiver.getCapabilities('audio').codecs;   // a packet lost on the Wi-Fi isn't a gap
-        at.setCodecPreferences(codecs.filter(c => /red/i.test(c.mimeType)).concat(codecs.filter(c => !/red/i.test(c.mimeType))));
-      } catch (e) {}
+      const vt = next.addTransceiver('video', { direction: 'recvonly' });   // video only: sound has its own stream
       try {                                             // H.264 first: the phone encodes it in hardware
         const codecs = RTCRtpReceiver.getCapabilities('video').codecs;
         const rank = c => !/h264/i.test(c.mimeType) ? 2 : /profile-level-id=64/i.test(c.sdpFmtpLine || '') ? 0 : 1;   // High profile first
         vt.setCodecPreferences(codecs.map((c, i) => [c, i]).sort((a, b) => rank(a[0]) - rank(b[0]) || a[1] - b[1]).map(x => x[0]));
       } catch (e) {}
       next.ontrack = (event) => {
-        if (event.track.kind === 'video') {             // video: as little buffering as the network allows. Sound keeps
-          try { event.receiver.jitterBufferTarget = 0; } catch (e) {}   // WebRTC's self-adjusting buffer: at zero it ran dry
-          try { event.receiver.playoutDelayHint = 0; } catch (e) {}     // on every Wi-Fi hiccup and broke up.
-        }
+        try { event.receiver.jitterBufferTarget = 0; } catch (e) {}     // as little buffering as the network allows
+        try { event.receiver.playoutDelayHint = 0; } catch (e) {}
         const stream = event.streams[0] || (video.srcObject instanceof MediaStream ? video.srcObject : new MediaStream());
         if (!stream.getTracks().includes(event.track)) stream.addTrack(event.track);
         if (video.srcObject !== stream) video.srcObject = stream;
@@ -187,14 +233,10 @@ async function playWebRTC(signal, fallbackSrc) {
         setTimeout(resolve, 1500);
       });
       // Tell the phone this TV decodes H.264 up to level 5.1 (the default 3.1 caps the picture at 720p, and the
-      // phone then gives up its hardware encoder), to start at 2 Mbit/s (higher stuffed weak Wi-Fi queues with
-      // video and the sound arrived in clumps), and to send stereo sound at up to 128 kbit/s for music and
-      // videos (WebRTC defaults to a mono voice call).
-      let offer = next.localDescription.sdp
+      // phone then gives up its hardware encoder), and to start at its fixed 3 Mbit/s.
+      const offer = next.localDescription.sdp
         .replace(/profile-level-id=([0-9a-f]{4})[0-9a-f]{2}/gi, (m, profile) => 'profile-level-id=' + profile + '33')
-        .replace(/(a=fmtp:\d+ [^\r\n]*packetization-mode=1[^\r\n]*)/g, '$1;x-google-start-bitrate=2000');
-      const opus = (offer.match(/a=rtpmap:(\d+) opus\/48000/i) || [])[1];
-      if (opus) offer = offer.replace(new RegExp('(a=fmtp:' + opus + ' [^\\r\\n]*)'), '$1;stereo=1;sprop-stereo=1;maxaveragebitrate=128000;maxplaybackrate=48000');
+        .replace(/(a=fmtp:\d+ [^\r\n]*packetization-mode=1[^\r\n]*)/g, '$1;x-google-start-bitrate=3000');
       const abort = new AbortController();                // the phone answers within ~2 s; don't wait forever
       const timer = setTimeout(() => abort.abort(), 8000);
       const res = await fetch(signal, { method: 'POST', headers: { 'Content-Type': 'text/plain' }, body: offer, cache: 'no-store', signal: abort.signal });
@@ -221,29 +263,21 @@ async function playWebRTC(signal, fallbackSrc) {
                            packetsLost: num(r.packetsLost), networkJitterMs: num(r.jitter) !== undefined ? Math.round(r.jitter * 1000) : undefined,
                            width: num(r.frameWidth), height: num(r.frameHeight), decoder: r.decoderImplementation });
       }
-      if (r.type === 'inbound-rtp' && (r.kind || r.mediaType) === 'audio') {
-        const got = num(r.totalSamplesReceived), hidden = num(r.concealedSamples), jbd = num(r.jitterBufferDelay), jbe = num(r.jitterBufferEmittedCount);
-        if (got !== undefined) {
-          s.audio = got > (prev.audio || 0) && (hidden || 0) < got;
-          // Share of the last 2 s of sound the TV had to make up (packets late or lost): breakups.
-          if (hidden !== undefined && prev.audio !== undefined && got > prev.audio) s.audioPatchedPct = Math.round((hidden - (prev.hidden || 0)) / (got - prev.audio) * 1000) / 10;
-          if (jbd !== undefined && jbe !== undefined && prev.ajbe !== undefined && jbe > prev.ajbe) s.audioBufferMs = Math.round((jbd - prev.ajbd) / (jbe - prev.ajbe) * 1000);
-          Object.assign(prev, { audio: got, hidden, ajbd: jbd, ajbe: jbe });
-        }
-        s.audioLost = num(r.packetsLost);
-        s.audioCodec = r.codecId;
-      }
       if (r.type === 'candidate-pair' && r.nominated && r.state === 'succeeded' && num(r.currentRoundTripTime) !== undefined) s.rttMs = Math.round(r.currentRoundTripTime * 1000);
     });
+    Object.assign(s, audioStats);                       // the sound stream: playing, how far behind, stalls
     if (s.jitterMs !== undefined) s.behind = Math.round((s.jitterMs + (s.rttMs || 0) / 2 + (s.decodeMs || 0)) / 10) / 100;
     window.castlabStats = s;                            // read by the Mac test tools
     report('stats', s);
-    // Link health: much invented sound, or a picture that stopped, for 6 s running means the link stalls.
+    // Link health: a picture that stopped, or sound stalling again and again, for 6 s running means the link
+    // stalls for longer than our buffers; the buffered stream copes with that.
     const frozen = s.frames !== undefined && s.frames === prev.lastFrames && pc.connectionState === 'connected';
     prev.lastFrames = s.frames;
-    const bad = (s.audioPatchedPct !== undefined && s.audioPatchedPct > 20) || frozen;
+    const soundStalled = s.audioStalls !== undefined && s.audioStalls - (prev.audioStalls || 0) >= 2;
+    prev.audioStalls = s.audioStalls;
+    const bad = frozen || soundStalled;
     badReports = bad ? badReports + 1 : 0;
-    if (badReports >= 3) switchToBuffered('weak Wi-Fi: ' + (frozen ? 'the picture stopped' : Math.round(s.audioPatchedPct) + '% of the sound was missing'));
+    if (badReports >= 3) switchToBuffered('weak Wi-Fi: ' + (frozen ? 'the picture stopped' : 'the sound kept stalling'));
   }, 2000);
   connect();
 }
