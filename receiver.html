@@ -183,11 +183,12 @@ async function playWebRTC(signal, fallbackSrc) {
         setTimeout(resolve, 1500);
       });
       // Tell the phone this TV decodes H.264 up to level 5.1 (the default 3.1 caps the picture at 720p, and the
-      // phone then gives up its hardware encoder), to start at 6 Mbit/s so the first picture is full size, and to
-      // send stereo sound at up to 128 kbit/s for music and videos (WebRTC defaults to a mono voice call).
+      // phone then gives up its hardware encoder), to start at 2 Mbit/s (higher stuffed weak Wi-Fi queues with
+      // video and the sound arrived in clumps), and to send stereo sound at up to 128 kbit/s for music and
+      // videos (WebRTC defaults to a mono voice call).
       let offer = next.localDescription.sdp
         .replace(/profile-level-id=([0-9a-f]{4})[0-9a-f]{2}/gi, (m, profile) => 'profile-level-id=' + profile + '33')
-        .replace(/(a=fmtp:\d+ [^\r\n]*packetization-mode=1[^\r\n]*)/g, '$1;x-google-start-bitrate=6000');
+        .replace(/(a=fmtp:\d+ [^\r\n]*packetization-mode=1[^\r\n]*)/g, '$1;x-google-start-bitrate=2000');
       const opus = (offer.match(/a=rtpmap:(\d+) opus\/48000/i) || [])[1];
       if (opus) offer = offer.replace(new RegExp('(a=fmtp:' + opus + ' [^\\r\\n]*)'), '$1;stereo=1;sprop-stereo=1;maxaveragebitrate=128000;maxplaybackrate=48000');
       const abort = new AbortController();                // the phone answers within ~2 s; don't wait forever
