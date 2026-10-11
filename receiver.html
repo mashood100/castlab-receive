@@ -116,17 +116,122 @@ async function pull(src, sb, queue, pump) {
   }
 }
 
+// WebRTC: the phone sends picture and sound as real-time media (UDP, encrypted, its own jitter buffer and
+// lip sync). The page makes the offer, POSTs it to the phone's signaling address and gets the answer.
+// If it never connects, the fragmented MP4 stream (`fallbackSrc`) takes over.
+async function playWebRTC(signal, fallbackSrc) {
+  if (started) return;
+  started = true;
+  say('CastLab: connecting…');
+  let pc = null, everConnected = false, failures = 0, retry = null;
+  const prev = {};
+  const reconnect = (why) => {
+    if (retry) return;
+    if (pc) { pc.close(); pc = null; }
+    failures++;
+    if (!everConnected && failures >= 3) {              // WebRTC doesn't work here: use the plain stream
+      report('reconnecting', { message: 'WebRTC failed (' + why + '), using the plain stream' });
+      started = false;
+      play(fallbackSrc);
+      return;
+    }
+    if (everConnected && failures >= 6) {               // the phone is gone: it stopped mirroring
+      say('CastLab: the phone stopped mirroring');
+      report('ended');
+      if (context) setTimeout(() => context.stop(), 3000);
+      return;
+    }
+    report('reconnecting', { message: why });
+    retry = setTimeout(() => { retry = null; connect(); }, 1000);
+  };
+  const connect = async () => {
+    try {
+      const next = new RTCPeerConnection({ iceServers: [] });
+      pc = next;
+      window.castlabPC = next;                          // for the Mac test tools
+      const vt = next.addTransceiver('video', { direction: 'recvonly' });
+      next.addTransceiver('audio', { direction: 'recvonly' });
+      try {                                             // H.264 first: the phone encodes it in hardware
+        const codecs = RTCRtpReceiver.getCapabilities('video').codecs;
+        vt.setCodecPreferences(codecs.filter(c => /h264/i.test(c.mimeType)).concat(codecs.filter(c => !/h264/i.test(c.mimeType))));
+      } catch (e) {}
+      next.ontrack = (event) => {
+        try { event.receiver.jitterBufferTarget = 0; } catch (e) {}   // as little buffering as the network allows
+        try { event.receiver.playoutDelayHint = 0; } catch (e) {}
+        const stream = event.streams[0] || (video.srcObject instanceof MediaStream ? video.srcObject : new MediaStream());
+        if (!stream.getTracks().includes(event.track)) stream.addTrack(event.track);
+        if (video.srcObject !== stream) video.srcObject = stream;
+        video.play().catch(() => {});
+      };
+      next.onconnectionstatechange = () => {
+        if (pc !== next) return;
+        if (next.connectionState === 'connected') { everConnected = true; failures = 0; say(''); report('playing'); }
+        if (next.connectionState === 'failed') reconnect('connection failed');
+        if (next.connectionState === 'disconnected') setTimeout(() => { if (pc === next && next.connectionState === 'disconnected') reconnect('connection lost'); }, 3000);
+      };
+      await next.setLocalDescription(await next.createOffer());
+      await new Promise(resolve => {                    // all local candidates in the offer: same Wi-Fi, quick
+        if (next.iceGatheringState === 'complete') return resolve();
+        next.addEventListener('icegatheringstatechange', () => { if (next.iceGatheringState === 'complete') resolve(); });
+        setTimeout(resolve, 1500);
+      });
+      // Tell the phone this TV decodes H.264 up to level 5.1. The default, 3.1, caps the picture at 720p, and
+      // the phone then gives up its hardware encoder for slow software encoding of the full screen.
+      // Also ask it to start at 6 Mbit/s, so the first picture is full size instead of growing over ~10 s.
+      const offer = next.localDescription.sdp
+        .replace(/profile-level-id=([0-9a-f]{4})[0-9a-f]{2}/gi, (m, profile) => 'profile-level-id=' + profile + '33')
+        .replace(/(a=fmtp:\d+ [^\r\n]*packetization-mode=1[^\r\n]*)/g, '$1;x-google-start-bitrate=6000');
+      const res = await fetch(signal, { method: 'POST', headers: { 'Content-Type': 'text/plain' }, body: offer, cache: 'no-store' });
+      if (!res.ok) throw new Error('HTTP ' + res.status);
+      await next.setRemoteDescription({ type: 'answer', sdp: await res.text() });
+    } catch (e) {
+      reconnect(e.message);
+    }
+  };
+  // Every 2 s: how far behind (jitter buffer + half the round trip + decoding), frame rate, freezes, sound.
+  setInterval(async () => {
+    if (!pc) return;
+    const s = { mode: 'webrtc' };
+    (await pc.getStats()).forEach(r => {
+      if (r.type === 'inbound-rtp' && r.kind === 'video') {
+        const jb = (r.jitterBufferDelay - (prev.jbd || 0)) / Math.max(1, r.jitterBufferEmittedCount - (prev.jbe || 0));
+        const dec = (r.totalDecodeTime - (prev.dec || 0)) / Math.max(1, r.framesDecoded - (prev.fd || 0));
+        Object.assign(prev, { jbd: r.jitterBufferDelay, jbe: r.jitterBufferEmittedCount, dec: r.totalDecodeTime, fd: r.framesDecoded });
+        Object.assign(s, { jitterMs: Math.round(jb * 1000), decodeMs: Math.round(dec * 1000), fps: r.framesPerSecond || 0,
+                           frames: r.framesDecoded, dropped: r.framesDropped || 0, freezes: r.freezeCount || 0,
+                           width: r.frameWidth, height: r.frameHeight });
+      }
+      if (r.type === 'inbound-rtp' && r.kind === 'audio') {
+        s.audio = r.totalSamplesReceived > (prev.audio || 0) && r.concealedSamples < r.totalSamplesReceived;
+        prev.audio = r.totalSamplesReceived;
+      }
+      if (r.type === 'candidate-pair' && r.nominated && r.state === 'succeeded') s.rttMs = Math.round((r.currentRoundTripTime || 0) * 1000);
+    });
+    if (s.jitterMs === undefined) return;
+    s.behind = Math.round((s.jitterMs + (s.rttMs || 0) / 2 + s.decodeMs) / 10) / 100;
+    window.castlabStats = s;                            // read by the Mac test tools
+    report('stats', s);
+  }, 2000);
+  connect();
+}
+
+function start(data) {
+  if (data.webrtc && window.RTCPeerConnection) playWebRTC(data.webrtc, data.url);
+  else play(data.url);
+}
+
 if (window.cast && cast.framework) {
   try {
     context = cast.framework.CastReceiverContext.getInstance();
-    context.addCustomMessageListener(NAMESPACE, event => { if (event.data && event.data.url) play(event.data.url); });
+    context.addCustomMessageListener(NAMESPACE, event => { if (event.data && event.data.url) start(event.data); });
     context.start({ disableIdleTimeout: true, statusText: 'CastLab' });
   } catch (e) {
     context = null;                                      // not a Cast device: play on our own below
   }
 }
 const own = new URL('/live.mp4', location.href).href;
-if (params.get('src')) play(params.get('src'));
+if (params.get('webrtc')) start({ webrtc: params.get('webrtc'), url: params.get('src') || own });
+else if (params.get('src')) play(params.get('src'));
 else if (location.protocol === 'http:') play(own);     // served by the phone: the stream is next door
 else if (!context) play(own);                            // plain browser over https: try anyway
 </script>
