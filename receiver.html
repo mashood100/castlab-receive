@@ -36,6 +36,7 @@ function play(src) {
   started = true;
   say('CastLab: connecting…');
   const ms = new MediaSource();
+  video.srcObject = null;                                // a WebRTC stream may have been attached before
   video.src = URL.createObjectURL(ms);
   ms.addEventListener('sourceopen', () => {
     const sb = ms.addSourceBuffer('video/mp4; codecs="avc1.640028, mp4a.40.2"');
@@ -70,7 +71,7 @@ function play(src) {
     video.playbackRate = behind > 0.4 ? 1.1 : 1.0;
     if (++tick % 4 === 0) {                                                     // every 2 s: the phone shows it
       const q = video.getVideoPlaybackQuality ? video.getVideoPlaybackQuality() : null;
-      report('stats', { behind: Math.round(behind * 100) / 100, audio: (video.webkitAudioDecodedByteCount || 0) > 0,
+      report('stats', { mode: 'buffered', behind: Math.round(behind * 100) / 100, audio: (video.webkitAudioDecodedByteCount || 0) > 0,
                         stalls, jumps, snaps, rate: video.playbackRate,
                         dropped: q ? q.droppedVideoFrames : -1, frames: q ? q.totalVideoFrames : -1 });
     }
@@ -123,24 +124,27 @@ async function playWebRTC(signal, fallbackSrc) {
   if (started) return;
   started = true;
   say('CastLab: connecting…');
-  let pc = null, everConnected = false, failures = 0, retry = null;
+  let pc = null, everConnected = false, failures = 0, retry = null, statsTimer = null, badReports = 0, switched = false;
   const prev = {};
+  // The buffered stream holds half a second of picture and sound, so it rides out Wi-Fi stalls that WebRTC
+  // can't. Used when WebRTC never connects, drops and won't come back, or runs on a link so bad that the
+  // TV has to invent much of the sound or the picture stops. One way: no switching back and forth.
+  const switchToBuffered = (why) => {
+    if (switched) return;
+    switched = true;
+    clearInterval(statsTimer);
+    if (retry) { clearTimeout(retry); retry = null; }
+    if (pc) { pc.close(); pc = null; }
+    report('mode', { mode: 'buffered', message: why });
+    started = false;
+    play(fallbackSrc);
+  };
   const reconnect = (why) => {
-    if (retry) return;
+    if (retry || switched) return;
     if (pc) { pc.close(); pc = null; }
     failures++;
-    if (!everConnected && failures >= 3) {              // WebRTC doesn't work here: use the plain stream
-      report('reconnecting', { message: 'WebRTC failed (' + why + '), using the plain stream' });
-      started = false;
-      play(fallbackSrc);
-      return;
-    }
-    if (everConnected && failures >= 6) {               // the phone is gone: it stopped mirroring
-      say('CastLab: the phone stopped mirroring');
-      report('ended');
-      if (context) setTimeout(() => context.stop(), 3000);
-      return;
-    }
+    if (!everConnected && failures >= 3) return switchToBuffered('WebRTC could not connect (' + why + ')');
+    if (everConnected && failures >= 3) return switchToBuffered('the WebRTC connection was lost (' + why + ')');
     report('reconnecting', { message: why });
     retry = setTimeout(() => { retry = null; connect(); }, 1000);
   };
@@ -204,7 +208,7 @@ async function playWebRTC(signal, fallbackSrc) {
   // Every 2 s: how far behind (jitter buffer + half the round trip + decoding), frame rate, freezes, sound.
   // Older browsers (some TVs) lack some of these numbers: each one is sent only when the TV provides it.
   const num = (x) => (typeof x === 'number' && isFinite(x)) ? x : undefined;
-  setInterval(async () => {
+  statsTimer = setInterval(async () => {
     if (!pc) return;
     const s = { mode: 'webrtc', connection: pc.connectionState };
     (await pc.getStats()).forEach(r => {
@@ -234,6 +238,12 @@ async function playWebRTC(signal, fallbackSrc) {
     if (s.jitterMs !== undefined) s.behind = Math.round((s.jitterMs + (s.rttMs || 0) / 2 + (s.decodeMs || 0)) / 10) / 100;
     window.castlabStats = s;                            // read by the Mac test tools
     report('stats', s);
+    // Link health: much invented sound, or a picture that stopped, for 6 s running means the link stalls.
+    const frozen = s.frames !== undefined && s.frames === prev.lastFrames && pc.connectionState === 'connected';
+    prev.lastFrames = s.frames;
+    const bad = (s.audioPatchedPct !== undefined && s.audioPatchedPct > 20) || frozen;
+    badReports = bad ? badReports + 1 : 0;
+    if (badReports >= 3) switchToBuffered('weak Wi-Fi: ' + (frozen ? 'the picture stopped' : Math.round(s.audioPatchedPct) + '% of the sound was missing'));
   }, 2000);
   connect();
 }
