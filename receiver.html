@@ -49,6 +49,10 @@ function play(src) {
     pull(src + (src.includes('?') ? '&' : '?') + 'audio=1', sb, queue, pump);   // picture and sound
   });
   video.addEventListener('playing', () => { say(''); report('playing'); });
+  // Counters sent with the stats, to see what a glitch was: the player ran dry (stall), we skipped a
+  // hole (jump) or snapped to the live edge (snap), or the TV's decoder dropped frames.
+  let stalls = 0, jumps = 0, snaps = 0;
+  video.addEventListener('waiting', () => { stalls++; });
   // Stay near the live edge: jump over holes (frames the phone skipped, reconnects), start where data
   // begins, snap after a stall, nudge the rate when slightly behind, and trim old data so memory stays flat.
   let tick = 0;
@@ -56,16 +60,19 @@ function play(src) {
     const b = video.buffered;
     if (!b.length) return;
     for (let i = 0; i < b.length - 1; i++) {
-      if (video.currentTime >= b.end(i) - 0.05 && video.currentTime < b.start(i + 1)) { video.currentTime = b.start(i + 1); break; }
+      if (video.currentTime >= b.end(i) - 0.05 && video.currentTime < b.start(i + 1)) { video.currentTime = b.start(i + 1); jumps++; break; }
     }
     const start = b.start(0);
     const end = b.end(b.length - 1);
     if (video.currentTime < start) video.currentTime = start;
     const behind = end - video.currentTime;
-    if (behind > 1.5) video.currentTime = end - 0.3;
+    if (behind > 1.5) { video.currentTime = end - 0.3; snaps++; }
     video.playbackRate = behind > 0.4 ? 1.1 : 1.0;
     if (++tick % 4 === 0) {                                                     // every 2 s: the phone shows it
-      report('stats', { behind: Math.round(behind * 100) / 100, audio: (video.webkitAudioDecodedByteCount || 0) > 0 });
+      const q = video.getVideoPlaybackQuality ? video.getVideoPlaybackQuality() : null;
+      report('stats', { behind: Math.round(behind * 100) / 100, audio: (video.webkitAudioDecodedByteCount || 0) > 0,
+                        stalls, jumps, snaps, rate: video.playbackRate,
+                        dropped: q ? q.droppedVideoFrames : -1, frames: q ? q.totalVideoFrames : -1 });
     }
     if (video.currentTime - start > 30) {
       try { ms.sourceBuffers[0].remove(start, video.currentTime - 10); } catch (e) {}
