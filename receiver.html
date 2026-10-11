@@ -153,7 +153,8 @@ async function playWebRTC(signal, fallbackSrc) {
       next.addTransceiver('audio', { direction: 'recvonly' });
       try {                                             // H.264 first: the phone encodes it in hardware
         const codecs = RTCRtpReceiver.getCapabilities('video').codecs;
-        vt.setCodecPreferences(codecs.filter(c => /h264/i.test(c.mimeType)).concat(codecs.filter(c => !/h264/i.test(c.mimeType))));
+        const rank = c => !/h264/i.test(c.mimeType) ? 2 : /profile-level-id=64/i.test(c.sdpFmtpLine || '') ? 0 : 1;   // High profile first
+        vt.setCodecPreferences(codecs.map((c, i) => [c, i]).sort((a, b) => rank(a[0]) - rank(b[0]) || a[1] - b[1]).map(x => x[0]));
       } catch (e) {}
       next.ontrack = (event) => {
         try { event.receiver.jitterBufferTarget = 0; } catch (e) {}   // as little buffering as the network allows
@@ -175,12 +176,14 @@ async function playWebRTC(signal, fallbackSrc) {
         next.addEventListener('icegatheringstatechange', () => { if (next.iceGatheringState === 'complete') resolve(); });
         setTimeout(resolve, 1500);
       });
-      // Tell the phone this TV decodes H.264 up to level 5.1. The default, 3.1, caps the picture at 720p, and
-      // the phone then gives up its hardware encoder for slow software encoding of the full screen.
-      // Also ask it to start at 6 Mbit/s, so the first picture is full size instead of growing over ~10 s.
-      const offer = next.localDescription.sdp
+      // Tell the phone this TV decodes H.264 up to level 5.1 (the default 3.1 caps the picture at 720p, and the
+      // phone then gives up its hardware encoder), to start at 6 Mbit/s so the first picture is full size, and to
+      // send stereo sound at up to 128 kbit/s for music and videos (WebRTC defaults to a mono voice call).
+      let offer = next.localDescription.sdp
         .replace(/profile-level-id=([0-9a-f]{4})[0-9a-f]{2}/gi, (m, profile) => 'profile-level-id=' + profile + '33')
         .replace(/(a=fmtp:\d+ [^\r\n]*packetization-mode=1[^\r\n]*)/g, '$1;x-google-start-bitrate=6000');
+      const opus = (offer.match(/a=rtpmap:(\d+) opus\/48000/i) || [])[1];
+      if (opus) offer = offer.replace(new RegExp('(a=fmtp:' + opus + ' [^\\r\\n]*)'), '$1;stereo=1;sprop-stereo=1;maxaveragebitrate=128000;maxplaybackrate=48000');
       const res = await fetch(signal, { method: 'POST', headers: { 'Content-Type': 'text/plain' }, body: offer, cache: 'no-store' });
       if (!res.ok) throw new Error('HTTP ' + res.status);
       await next.setRemoteDescription({ type: 'answer', sdp: await res.text() });
@@ -189,26 +192,28 @@ async function playWebRTC(signal, fallbackSrc) {
     }
   };
   // Every 2 s: how far behind (jitter buffer + half the round trip + decoding), frame rate, freezes, sound.
+  // Older browsers (some TVs) lack some of these numbers: each one is sent only when the TV provides it.
+  const num = (x) => (typeof x === 'number' && isFinite(x)) ? x : undefined;
   setInterval(async () => {
     if (!pc) return;
-    const s = { mode: 'webrtc' };
+    const s = { mode: 'webrtc', state: pc.connectionState };
     (await pc.getStats()).forEach(r => {
-      if (r.type === 'inbound-rtp' && r.kind === 'video') {
-        const jb = (r.jitterBufferDelay - (prev.jbd || 0)) / Math.max(1, r.jitterBufferEmittedCount - (prev.jbe || 0));
-        const dec = (r.totalDecodeTime - (prev.dec || 0)) / Math.max(1, r.framesDecoded - (prev.fd || 0));
-        Object.assign(prev, { jbd: r.jitterBufferDelay, jbe: r.jitterBufferEmittedCount, dec: r.totalDecodeTime, fd: r.framesDecoded });
-        Object.assign(s, { jitterMs: Math.round(jb * 1000), decodeMs: Math.round(dec * 1000), fps: r.framesPerSecond || 0,
-                           frames: r.framesDecoded, dropped: r.framesDropped || 0, freezes: r.freezeCount || 0,
-                           width: r.frameWidth, height: r.frameHeight });
+      if (r.type === 'inbound-rtp' && (r.kind || r.mediaType) === 'video') {
+        const jbd = num(r.jitterBufferDelay), jbe = num(r.jitterBufferEmittedCount), dec = num(r.totalDecodeTime), fd = num(r.framesDecoded);
+        if (jbd !== undefined && jbe !== undefined && prev.jbe !== undefined && jbe > prev.jbe) s.jitterMs = Math.round((jbd - prev.jbd) / (jbe - prev.jbe) * 1000);
+        if (dec !== undefined && fd !== undefined && prev.fd !== undefined && fd > prev.fd) s.decodeMs = Math.round((dec - prev.dec) / (fd - prev.fd) * 1000);
+        Object.assign(prev, { jbd, jbe, dec, fd });
+        Object.assign(s, { fps: num(r.framesPerSecond), frames: fd, dropped: num(r.framesDropped), freezes: num(r.freezeCount),
+                           packetsLost: num(r.packetsLost), networkJitterMs: num(r.jitter) !== undefined ? Math.round(r.jitter * 1000) : undefined,
+                           width: num(r.frameWidth), height: num(r.frameHeight), decoder: r.decoderImplementation });
       }
-      if (r.type === 'inbound-rtp' && r.kind === 'audio') {
-        s.audio = r.totalSamplesReceived > (prev.audio || 0) && r.concealedSamples < r.totalSamplesReceived;
-        prev.audio = r.totalSamplesReceived;
+      if (r.type === 'inbound-rtp' && (r.kind || r.mediaType) === 'audio') {
+        const got = num(r.totalSamplesReceived);
+        if (got !== undefined) { s.audio = got > (prev.audio || 0) && (num(r.concealedSamples) || 0) < got; prev.audio = got; }
       }
-      if (r.type === 'candidate-pair' && r.nominated && r.state === 'succeeded') s.rttMs = Math.round((r.currentRoundTripTime || 0) * 1000);
+      if (r.type === 'candidate-pair' && r.nominated && r.state === 'succeeded' && num(r.currentRoundTripTime) !== undefined) s.rttMs = Math.round(r.currentRoundTripTime * 1000);
     });
-    if (s.jitterMs === undefined) return;
-    s.behind = Math.round((s.jitterMs + (s.rttMs || 0) / 2 + s.decodeMs) / 10) / 100;
+    if (s.jitterMs !== undefined) s.behind = Math.round((s.jitterMs + (s.rttMs || 0) / 2 + (s.decodeMs || 0)) / 10) / 100;
     window.castlabStats = s;                            // read by the Mac test tools
     report('stats', s);
   }, 2000);
