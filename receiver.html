@@ -56,7 +56,7 @@ function play(src) {
     sb.addEventListener('updateend', () => {
       pump();
       const b = video.buffered;
-      if (video.paused && b.length && b.end(b.length - 1) - Math.max(video.currentTime, b.start(0)) >= 1.0) video.play().catch(() => {});
+      if (video.paused && b.length && b.end(b.length - 1) - Math.max(video.currentTime, b.start(0)) >= hold) video.play().catch(() => {});
     });
     sb.addEventListener('error', () => { say('CastLab: decode error'); report('error', { message: 'decode error' }); });
     pull(src + (src.includes('?') ? '&' : '?') + 'audio=1', sb, queue, pump);   // picture and sound
@@ -65,8 +65,10 @@ function play(src) {
   // Counters sent with the stats, to see what a glitch was: the player ran dry (stall), we skipped a
   // hole (jump) or snapped to the live edge (snap), or the TV's decoder dropped frames.
   let stalls = 0, jumps = 0, snaps = 0;
-  video.addEventListener('waiting', () => { stalls++; });
-  // Hold about a second behind the live edge: that rides out the Wi-Fi stalls this stream is used for.
+  // Hold a second behind the live edge, and half a second more after every time the player runs dry (up
+  // to 3 s): a good Wi-Fi keeps the 1 s delay, a stalling one settles where its stalls fit.
+  let hold = 1.0;
+  video.addEventListener('waiting', () => { stalls++; hold = Math.min(3, hold + 0.5); });
   // Jump over holes (frames the phone skipped, reconnects), start where data begins, catch up gently when
   // a stall left us far behind (a visible speed-up at 1.1x was the glitch), snap only when hopelessly far,
   // and trim old data so memory stays flat.
@@ -84,14 +86,14 @@ function play(src) {
     const end = b.end(b.length - 1);
     if (video.currentTime < start) video.currentTime = start;
     const behind = end - video.currentTime;
-    if (behind > 4) { video.currentTime = end - 1.0; snaps++; }
+    if (behind > hold + 3) { video.currentTime = end - hold; snaps++; }
     // Catch up at 2%, which the eye doesn't notice, and only switch rates with some room (hysteresis):
     // every rate change is a tiny judder.
-    if (video.playbackRate === 1 && behind > 1.8) video.playbackRate = 1.02;
-    else if (video.playbackRate !== 1 && behind < 1.2) video.playbackRate = 1;
+    if (video.playbackRate === 1 && behind > hold + 0.8) video.playbackRate = 1.02;
+    else if (video.playbackRate !== 1 && behind < hold + 0.2) video.playbackRate = 1;
     if (++tick % 4 === 0) {                                                     // every 2 s: the phone shows it
       const q = video.getVideoPlaybackQuality ? video.getVideoPlaybackQuality() : null;
-      report('stats', { mode: 'buffered', behind: Math.round(behind * 100) / 100, audio: (video.webkitAudioDecodedByteCount || 0) > 0,
+      report('stats', { mode: 'buffered', behind: Math.round(behind * 100) / 100, hold, audio: (video.webkitAudioDecodedByteCount || 0) > 0,
                         stalls, jumps, snaps, rate: video.playbackRate,
                         dropped: q ? q.droppedVideoFrames : -1, frames: q ? q.totalVideoFrames : -1 });
     }
