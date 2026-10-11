@@ -20,6 +20,8 @@
 // when the phone itself serves the page. Works in a plain browser too (no Cast framework): open
 // http://<phone>:8090/ on the same Wi-Fi.
 const NAMESPACE = 'urn:x-cast:com.mashoodhussain.castlab';
+const PAGE_VERSION = '2026-10-11c';            // a TV remembers "buffered only" per page version
+const BUFFERED_ONLY_KEY = 'castlab-buffered-only';
 const video = document.getElementById('v');
 const audioEl = document.getElementById('a');
 let audioStop = null;           // stops the separate sound stream, when the buffered video stream takes over
@@ -41,6 +43,7 @@ function play(src) {
   say('CastLab: connecting…');
   const ms = new MediaSource();
   video.srcObject = null;                                // a WebRTC stream may have been attached before
+  video.autoplay = false;                                // start once a second is buffered, not on the first frame
   video.src = URL.createObjectURL(ms);
   ms.addEventListener('sourceopen', () => {
     const sb = ms.addSourceBuffer('video/mp4; codecs="avc1.640028, mp4a.40.2"');
@@ -49,7 +52,11 @@ function play(src) {
       if (sb.updating || !queue.length) return;
       try { sb.appendBuffer(queue.shift()); } catch (e) { queue.length = 0; }
     };
-    sb.addEventListener('updateend', () => { pump(); if (video.paused) video.play().catch(() => {}); });
+    sb.addEventListener('updateend', () => {
+      pump();
+      const b = video.buffered;
+      if (video.paused && b.length && b.end(b.length - 1) - Math.max(video.currentTime, b.start(0)) >= 1.0) video.play().catch(() => {});
+    });
     sb.addEventListener('error', () => { say('CastLab: decode error'); report('error', { message: 'decode error' }); });
     pull(src + (src.includes('?') ? '&' : '?') + 'audio=1', sb, queue, pump);   // picture and sound
   });
@@ -58,21 +65,26 @@ function play(src) {
   // hole (jump) or snapped to the live edge (snap), or the TV's decoder dropped frames.
   let stalls = 0, jumps = 0, snaps = 0;
   video.addEventListener('waiting', () => { stalls++; });
-  // Stay near the live edge: jump over holes (frames the phone skipped, reconnects), start where data
-  // begins, snap after a stall, nudge the rate when slightly behind, and trim old data so memory stays flat.
+  // Hold about a second behind the live edge: that rides out the Wi-Fi stalls this stream is used for.
+  // Jump over holes (frames the phone skipped, reconnects), start where data begins, catch up gently when
+  // a stall left us far behind (a visible speed-up at 1.1x was the glitch), snap only when hopelessly far,
+  // and trim old data so memory stays flat.
   let tick = 0;
   setInterval(() => {
     const b = video.buffered;
     if (!b.length) return;
+    // A hole after a reconnect or a skip: once the player has run into it (stalled, or within 0.3 s of the
+    // hole's start), continue from the data after it.
     for (let i = 0; i < b.length - 1; i++) {
-      if (video.currentTime >= b.end(i) - 0.05 && video.currentTime < b.start(i + 1)) { video.currentTime = b.start(i + 1); jumps++; break; }
+      const atHole = video.currentTime >= b.end(i) - 0.3 || video.readyState < 3;
+      if (atHole && video.currentTime < b.start(i + 1) && video.currentTime >= b.start(i)) { video.currentTime = b.start(i + 1); jumps++; break; }
     }
     const start = b.start(0);
     const end = b.end(b.length - 1);
     if (video.currentTime < start) video.currentTime = start;
     const behind = end - video.currentTime;
-    if (behind > 1.5) { video.currentTime = end - 0.3; snaps++; }
-    video.playbackRate = behind > 0.4 ? 1.1 : 1.0;
+    if (behind > 4) { video.currentTime = end - 1.0; snaps++; }
+    video.playbackRate = behind > 1.6 ? 1.05 : 1.0;
     if (++tick % 4 === 0) {                                                     // every 2 s: the phone shows it
       const q = video.getVideoPlaybackQuality ? video.getVideoPlaybackQuality() : null;
       report('stats', { mode: 'buffered', behind: Math.round(behind * 100) / 100, audio: (video.webkitAudioDecodedByteCount || 0) > 0,
@@ -171,8 +183,16 @@ function playAudioStream(src, onStuck) {
     if (!playing) {                                     // nothing moves: coax it, then give up on this element
       if (!dataSince) dataSince = Date.now();
       tryPlay();
-      if (Date.now() - dataSince > 3000 && !mutedTry) { mutedTry = true; a.muted = true; tryPlay(); }   // the classic autoplay workaround
-      if (Date.now() - dataSince > 8000 && !gaveUp) { gaveUp = true; if (onStuck) onStuck('the sound player would not start (' + (playError || 'paused ' + a.paused + ', ready ' + a.readyState) + ')'); }
+      const waited = Date.now() - dataSince;
+      if (waited > 3000 && a.paused && !mutedTry) { mutedTry = true; a.muted = true; tryPlay(); }   // the autoplay workaround
+      // "Playing" yet never past metadata with over a second buffered: this TV's browser won't decode an
+      // audio-only stream. Remember that, so the next cast starts in buffered mode without the wait.
+      const neverDecodes = !a.paused && a.readyState <= 1 && end - start > 1.0 && waited > 3000;
+      if ((neverDecodes || waited > 8000) && !gaveUp) {
+        gaveUp = true;
+        if (neverDecodes) { try { localStorage.setItem(BUFFERED_ONLY_KEY, PAGE_VERSION); } catch (e) {} }
+        if (onStuck) onStuck('the sound player would not start (' + (playError || 'paused ' + a.paused + ', ready ' + a.readyState) + ')');
+      }
       return;
     }
     if (behind > 1.0) a.currentTime = end - 0.3;                       // after a stall: snap back near live
@@ -306,8 +326,16 @@ async function playWebRTC(signal, fallbackSrc) {
 }
 
 function start(data) {
-  if (data.webrtc && window.RTCPeerConnection) playWebRTC(data.webrtc, data.url);
-  else play(data.url);
+  let bufferedOnly = false;
+  try { bufferedOnly = localStorage.getItem(BUFFERED_ONLY_KEY) === PAGE_VERSION; } catch (e) {}
+  if (bufferedOnly) {
+    report('mode', { mode: 'buffered', message: 'this TV cannot play the separate sound stream (remembered)' });
+    play(data.url);
+  } else if (data.webrtc && window.RTCPeerConnection) {
+    playWebRTC(data.webrtc, data.url);
+  } else {
+    play(data.url);
+  }
 }
 
 if (window.cast && cast.framework) {
