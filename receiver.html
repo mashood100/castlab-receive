@@ -150,15 +150,21 @@ async function playWebRTC(signal, fallbackSrc) {
       pc = next;
       window.castlabPC = next;                          // for the Mac test tools
       const vt = next.addTransceiver('video', { direction: 'recvonly' });
-      next.addTransceiver('audio', { direction: 'recvonly' });
+      const at = next.addTransceiver('audio', { direction: 'recvonly' });
+      try {                                             // RED first: each sound packet also carries the previous one, so
+        const codecs = RTCRtpReceiver.getCapabilities('audio').codecs;   // a packet lost on the Wi-Fi isn't a gap
+        at.setCodecPreferences(codecs.filter(c => /red/i.test(c.mimeType)).concat(codecs.filter(c => !/red/i.test(c.mimeType))));
+      } catch (e) {}
       try {                                             // H.264 first: the phone encodes it in hardware
         const codecs = RTCRtpReceiver.getCapabilities('video').codecs;
         const rank = c => !/h264/i.test(c.mimeType) ? 2 : /profile-level-id=64/i.test(c.sdpFmtpLine || '') ? 0 : 1;   // High profile first
         vt.setCodecPreferences(codecs.map((c, i) => [c, i]).sort((a, b) => rank(a[0]) - rank(b[0]) || a[1] - b[1]).map(x => x[0]));
       } catch (e) {}
       next.ontrack = (event) => {
-        try { event.receiver.jitterBufferTarget = 0; } catch (e) {}   // as little buffering as the network allows
-        try { event.receiver.playoutDelayHint = 0; } catch (e) {}
+        if (event.track.kind === 'video') {             // video: as little buffering as the network allows. Sound keeps
+          try { event.receiver.jitterBufferTarget = 0; } catch (e) {}   // WebRTC's self-adjusting buffer: at zero it ran dry
+          try { event.receiver.playoutDelayHint = 0; } catch (e) {}     // on every Wi-Fi hiccup and broke up.
+        }
         const stream = event.streams[0] || (video.srcObject instanceof MediaStream ? video.srcObject : new MediaStream());
         if (!stream.getTracks().includes(event.track)) stream.addTrack(event.track);
         if (video.srcObject !== stream) video.srcObject = stream;
@@ -211,8 +217,16 @@ async function playWebRTC(signal, fallbackSrc) {
                            width: num(r.frameWidth), height: num(r.frameHeight), decoder: r.decoderImplementation });
       }
       if (r.type === 'inbound-rtp' && (r.kind || r.mediaType) === 'audio') {
-        const got = num(r.totalSamplesReceived);
-        if (got !== undefined) { s.audio = got > (prev.audio || 0) && (num(r.concealedSamples) || 0) < got; prev.audio = got; }
+        const got = num(r.totalSamplesReceived), hidden = num(r.concealedSamples), jbd = num(r.jitterBufferDelay), jbe = num(r.jitterBufferEmittedCount);
+        if (got !== undefined) {
+          s.audio = got > (prev.audio || 0) && (hidden || 0) < got;
+          // Share of the last 2 s of sound the TV had to make up (packets late or lost): breakups.
+          if (hidden !== undefined && prev.audio !== undefined && got > prev.audio) s.audioPatchedPct = Math.round((hidden - (prev.hidden || 0)) / (got - prev.audio) * 1000) / 10;
+          if (jbd !== undefined && jbe !== undefined && prev.ajbe !== undefined && jbe > prev.ajbe) s.audioBufferMs = Math.round((jbd - prev.ajbd) / (jbe - prev.ajbe) * 1000);
+          Object.assign(prev, { audio: got, hidden, ajbd: jbd, ajbe: jbe });
+        }
+        s.audioLost = num(r.packetsLost);
+        s.audioCodec = r.codecId;
       }
       if (r.type === 'candidate-pair' && r.nominated && r.state === 'succeeded' && num(r.currentRoundTripTime) !== undefined) s.rttMs = Math.round(r.currentRoundTripTime * 1000);
     });
