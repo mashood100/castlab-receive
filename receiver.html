@@ -11,7 +11,7 @@
 <script src="//www.gstatic.com/cast/sdk/libs/caf_receiver/v3/cast_receiver_framework.js"></script>
 </head>
 <body>
-<video id="v" autoplay muted playsinline></video>
+<video id="v" autoplay playsinline></video>
 <div id="msg">CastLab: waiting for the phone…</div>
 <script>
 // CastLab receiver page. Plays the phone's fragmented MP4 through MediaSource and stays near the live edge.
@@ -26,9 +26,9 @@ let context = null;
 let started = false;
 
 function say(text) { msg.textContent = text; }
-function report(state, message, behind) {
+function report(state, extra) {
   if (!context) return;
-  try { context.sendCustomMessage(NAMESPACE, undefined, { state, message: message || '', behind }); } catch (e) {}
+  try { context.sendCustomMessage(NAMESPACE, undefined, Object.assign({ state }, extra)); } catch (e) {}
 }
 
 function play(src) {
@@ -38,15 +38,15 @@ function play(src) {
   const ms = new MediaSource();
   video.src = URL.createObjectURL(ms);
   ms.addEventListener('sourceopen', () => {
-    const sb = ms.addSourceBuffer('video/mp4; codecs="avc1.640028"');
+    const sb = ms.addSourceBuffer('video/mp4; codecs="avc1.640028, mp4a.40.2"');
     const queue = [];
     const pump = () => {
       if (sb.updating || !queue.length) return;
       try { sb.appendBuffer(queue.shift()); } catch (e) { queue.length = 0; }
     };
     sb.addEventListener('updateend', () => { pump(); if (video.paused) video.play().catch(() => {}); });
-    sb.addEventListener('error', () => { say('CastLab: decode error'); report('error', 'decode error'); });
-    pull(src, sb, queue, pump);
+    sb.addEventListener('error', () => { say('CastLab: decode error'); report('error', { message: 'decode error' }); });
+    pull(src + (src.includes('?') ? '&' : '?') + 'audio=1', sb, queue, pump);   // picture and sound
   });
   video.addEventListener('playing', () => { say(''); report('playing'); });
   // Stay near the live edge: jump over holes (frames the phone skipped, reconnects), start where data
@@ -64,7 +64,9 @@ function play(src) {
     const behind = end - video.currentTime;
     if (behind > 1.5) video.currentTime = end - 0.3;
     video.playbackRate = behind > 0.4 ? 1.1 : 1.0;
-    if (++tick % 4 === 0) report('stats', '', Math.round(behind * 100) / 100);   // every 2 s: the phone shows it
+    if (++tick % 4 === 0) {                                                     // every 2 s: the phone shows it
+      report('stats', { behind: Math.round(behind * 100) / 100, audio: (video.webkitAudioDecodedByteCount || 0) > 0 });
+    }
     if (video.currentTime - start > 30) {
       try { ms.sourceBuffers[0].remove(start, video.currentTime - 10); } catch (e) {}
     }
@@ -95,10 +97,10 @@ async function pull(src, sb, queue, pump) {
     } catch (e) {
       if (++failures > 20) {                       // about 10 s of tries: the phone is gone
         say('CastLab: cannot reach the phone (' + e.message + ')');
-        report('error', e.message);
+        report('error', { message: e.message });
         return;
       }
-      report('reconnecting', e.message);
+      report('reconnecting', { message: e.message });
       // The new connection starts over with a fresh init segment: drop the cut-off piece of the old one.
       queue.length = 0;
       try { sb.abort(); } catch (err) {}
