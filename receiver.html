@@ -184,7 +184,10 @@ async function playWebRTC(signal, fallbackSrc) {
         .replace(/(a=fmtp:\d+ [^\r\n]*packetization-mode=1[^\r\n]*)/g, '$1;x-google-start-bitrate=6000');
       const opus = (offer.match(/a=rtpmap:(\d+) opus\/48000/i) || [])[1];
       if (opus) offer = offer.replace(new RegExp('(a=fmtp:' + opus + ' [^\\r\\n]*)'), '$1;stereo=1;sprop-stereo=1;maxaveragebitrate=128000;maxplaybackrate=48000');
-      const res = await fetch(signal, { method: 'POST', headers: { 'Content-Type': 'text/plain' }, body: offer, cache: 'no-store' });
+      const abort = new AbortController();                // the phone answers within ~2 s; don't wait forever
+      const timer = setTimeout(() => abort.abort(), 8000);
+      const res = await fetch(signal, { method: 'POST', headers: { 'Content-Type': 'text/plain' }, body: offer, cache: 'no-store', signal: abort.signal });
+      clearTimeout(timer);
       if (!res.ok) throw new Error('HTTP ' + res.status);
       await next.setRemoteDescription({ type: 'answer', sdp: await res.text() });
     } catch (e) {
@@ -196,7 +199,7 @@ async function playWebRTC(signal, fallbackSrc) {
   const num = (x) => (typeof x === 'number' && isFinite(x)) ? x : undefined;
   setInterval(async () => {
     if (!pc) return;
-    const s = { mode: 'webrtc', state: pc.connectionState };
+    const s = { mode: 'webrtc', connection: pc.connectionState };
     (await pc.getStats()).forEach(r => {
       if (r.type === 'inbound-rtp' && (r.kind || r.mediaType) === 'video') {
         const jbd = num(r.jitterBufferDelay), jbe = num(r.jitterBufferEmittedCount), dec = num(r.totalDecodeTime), fd = num(r.framesDecoded);
