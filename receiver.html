@@ -12,7 +12,7 @@
 </head>
 <body>
 <video id="v" autoplay playsinline></video>
-<audio id="a" autoplay></audio>
+<video id="a" autoplay playsinline style="position:fixed;width:1px;height:1px;opacity:0"></video>
 <div id="msg">CastLab: waiting for the phone…</div>
 <script>
 // CastLab receiver page. Plays the phone's fragmented MP4 through MediaSource and stays near the live edge.
@@ -128,33 +128,56 @@ async function pull(src, sb, queue, pump, stop = { aborted: false }, onEnded = s
 // The sound, on its own stream next to the WebRTC video. Carried inside WebRTC it shared the phone's Wi-Fi
 // queue with the video and arrived in clumps whenever that queue backed up. Here it is AAC in a fragmented
 // MP4 over its own connection, played about 0.3 s behind the live edge, so queue hiccups don't reach the ear.
-function playAudioStream(src) {
+// It plays in a hidden <video> element: this TV's browser never started a plain <audio> element.
+// `onStuck` is called if playback still hasn't started 8 s after data arrived.
+function playAudioStream(src, onStuck) {
   const a = audioEl;
   const ms = new MediaSource();
   const stop = { aborted: false, controller: null };
-  let stalls = 0, sb = null;
+  let stalls = 0, sb = null, playError = '', dataSince = 0, mutedTry = false, gaveUp = false;
   a.src = URL.createObjectURL(ms);
   a.addEventListener('waiting', () => { stalls++; });
+  const tryPlay = () => {
+    if (!a.paused) return;
+    a.play().then(() => { if (a.muted) a.muted = false; }).catch(e => { playError = e && e.name ? e.name + ': ' + e.message : String(e); });
+  };
   ms.addEventListener('sourceopen', () => {
-    sb = ms.addSourceBuffer('audio/mp4; codecs="mp4a.40.2"');
+    try {
+      sb = ms.addSourceBuffer('audio/mp4; codecs="mp4a.40.2"');
+    } catch (e) {
+      playError = 'addSourceBuffer ' + e.name;
+      return;
+    }
     const queue = [];
     const pump = () => {
       if (sb.updating || !queue.length) return;
       try { sb.appendBuffer(queue.shift()); } catch (e) { queue.length = 0; }
     };
-    sb.addEventListener('updateend', () => { pump(); if (a.paused) a.play().catch(() => {}); });
+    sb.addEventListener('updateend', () => { pump(); tryPlay(); });
     pull(src, sb, queue, pump, stop, () => {});          // the end of mirroring is announced by the video side
   });
   const timer = setInterval(() => {
     const b = a.buffered;
+    const end = b.length ? b.end(b.length - 1) : 0;
+    const playing = !a.paused && a.readyState >= 3;
+    audioStats = { audio: playing, audioStalls: stalls, audioPaused: a.paused, audioReady: a.readyState,
+                   audioT: Math.round(a.currentTime * 100) / 100, audioEnd: Math.round(end * 100) / 100,
+                   audioErr: (a.error && a.error.code) || (playError ? playError.slice(0, 60) : 0) };
     if (!b.length) return;
-    const start = b.start(0), end = b.end(b.length - 1);
+    const start = b.start(0);
     if (a.currentTime < start) a.currentTime = start;
     const behind = end - a.currentTime;
+    audioStats.audioBehind = Math.round(behind * 100) / 100;
+    if (!playing) {                                     // nothing moves: coax it, then give up on this element
+      if (!dataSince) dataSince = Date.now();
+      tryPlay();
+      if (Date.now() - dataSince > 3000 && !mutedTry) { mutedTry = true; a.muted = true; tryPlay(); }   // the classic autoplay workaround
+      if (Date.now() - dataSince > 8000 && !gaveUp) { gaveUp = true; if (onStuck) onStuck('the sound player would not start (' + (playError || 'paused ' + a.paused + ', ready ' + a.readyState) + ')'); }
+      return;
+    }
     if (behind > 1.0) a.currentTime = end - 0.3;                       // after a stall: snap back near live
     a.playbackRate = behind > 0.4 ? 1.03 : behind < 0.2 ? 0.98 : 1;   // settles ~0.3 s behind; gentle, so the pitch stays steady
     if (a.currentTime - start > 30) { try { sb.remove(start, a.currentTime - 10); } catch (e) {} }
-    audioStats = { audio: !a.paused && a.readyState >= 3, audioBehind: Math.round(behind * 100) / 100, audioStalls: stalls };
   }, 500);
   audioStop = () => {
     clearInterval(timer);
@@ -175,13 +198,13 @@ async function playWebRTC(signal, fallbackSrc) {
   if (started) return;
   started = true;
   say('CastLab: connecting…');
-  playAudioStream(fallbackSrc.replace('live.mp4', 'live.m4a'));
+  playAudioStream(fallbackSrc.replace('live.mp4', 'live.m4a'), why => switchToBuffered(why));
   let pc = null, everConnected = false, failures = 0, retry = null, statsTimer = null, badReports = 0, switched = false;
   const prev = {};
   // The buffered stream holds half a second of picture and sound, so it rides out Wi-Fi stalls that WebRTC
   // can't. Used when WebRTC never connects, drops and won't come back, or runs on a link so bad that the
   // TV has to invent much of the sound or the picture stops. One way: no switching back and forth.
-  const switchToBuffered = (why) => {
+  function switchToBuffered(why) {
     if (switched) return;
     switched = true;
     clearInterval(statsTimer);
@@ -191,7 +214,7 @@ async function playWebRTC(signal, fallbackSrc) {
     report('mode', { mode: 'buffered', message: why });
     started = false;
     play(fallbackSrc);
-  };
+  }
   const reconnect = (why) => {
     if (retry || switched) return;
     if (pc) { pc.close(); pc = null; }
