@@ -34,50 +34,77 @@ function report(state, message, behind) {
 function play(src) {
   if (started) return;
   started = true;
-  say('CastLab: connecting to ' + src);
+  say('CastLab: connecting…');
   const ms = new MediaSource();
   video.src = URL.createObjectURL(ms);
-  ms.addEventListener('sourceopen', async () => {
+  ms.addEventListener('sourceopen', () => {
     const sb = ms.addSourceBuffer('video/mp4; codecs="avc1.640028"');
     const queue = [];
-    const pump = () => { if (!sb.updating && queue.length) sb.appendBuffer(queue.shift()); };
+    const pump = () => {
+      if (sb.updating || !queue.length) return;
+      try { sb.appendBuffer(queue.shift()); } catch (e) { queue.length = 0; }
+    };
     sb.addEventListener('updateend', () => { pump(); if (video.paused) video.play().catch(() => {}); });
     sb.addEventListener('error', () => { say('CastLab: decode error'); report('error', 'decode error'); });
-    try {
-      const res = await fetch(src);
-      if (!res.ok) throw new Error('HTTP ' + res.status);
-      const reader = res.body.getReader();
-      for (;;) {
-        const { value, done } = await reader.read();
-        if (done) break;
-        queue.push(value);
-        pump();
-      }
-      say('CastLab: the phone stopped mirroring');
-      report('ended');
-      if (context) setTimeout(() => context.stop(), 3000);
-    } catch (e) {
-      say('CastLab: cannot reach the phone (' + e.message + ')');
-      report('error', e.message);
-    }
+    pull(src, sb, queue, pump);
   });
   video.addEventListener('playing', () => { say(''); report('playing'); });
-  // Stay near the live edge: start where data begins, snap after a stall, nudge the rate when slightly
-  // behind, and trim old data so memory stays flat.
+  // Stay near the live edge: jump over holes (frames the phone skipped, reconnects), start where data
+  // begins, snap after a stall, nudge the rate when slightly behind, and trim old data so memory stays flat.
   let tick = 0;
   setInterval(() => {
-    if (!video.buffered.length) return;
-    const start = video.buffered.start(0);
-    const end = video.buffered.end(video.buffered.length - 1);
+    const b = video.buffered;
+    if (!b.length) return;
+    for (let i = 0; i < b.length - 1; i++) {
+      if (video.currentTime >= b.end(i) - 0.05 && video.currentTime < b.start(i + 1)) { video.currentTime = b.start(i + 1); break; }
+    }
+    const start = b.start(0);
+    const end = b.end(b.length - 1);
     if (video.currentTime < start) video.currentTime = start;
     const behind = end - video.currentTime;
     if (behind > 1.5) video.currentTime = end - 0.3;
-    video.playbackRate = behind > 0.6 ? 1.1 : 1.0;
+    video.playbackRate = behind > 0.4 ? 1.1 : 1.0;
     if (++tick % 4 === 0) report('stats', '', Math.round(behind * 100) / 100);   // every 2 s: the phone shows it
     if (video.currentTime - start > 30) {
       try { ms.sourceBuffers[0].remove(start, video.currentTime - 10); } catch (e) {}
     }
   }, 500);
+}
+
+// Streams the phone's video into the player and reconnects when the connection drops, for example on a
+// Wi-Fi hiccup. A clean end of the stream means the phone stopped mirroring.
+async function pull(src, sb, queue, pump) {
+  let failures = 0;
+  for (;;) {
+    try {
+      const res = await fetch(src, { cache: 'no-store' });
+      if (!res.ok) throw new Error('HTTP ' + res.status);
+      failures = 0;
+      const reader = res.body.getReader();
+      for (;;) {
+        const { value, done } = await reader.read();
+        if (done) {
+          say('CastLab: the phone stopped mirroring');
+          report('ended');
+          if (context) setTimeout(() => context.stop(), 3000);
+          return;
+        }
+        queue.push(value);
+        pump();
+      }
+    } catch (e) {
+      if (++failures > 20) {                       // about 10 s of tries: the phone is gone
+        say('CastLab: cannot reach the phone (' + e.message + ')');
+        report('error', e.message);
+        return;
+      }
+      report('reconnecting', e.message);
+      // The new connection starts over with a fresh init segment: drop the cut-off piece of the old one.
+      queue.length = 0;
+      try { sb.abort(); } catch (err) {}
+      await new Promise(resolve => setTimeout(resolve, 500));
+    }
+  }
 }
 
 if (window.cast && cast.framework) {
